@@ -1,0 +1,49 @@
+__pycache__/
+env/
+venv/
+env.bak/
+venv.bak/
+.python-version
+__pypackages__/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Python
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ML/Models (large files)
+*.pt
+*.pth
+*.onnx
+*.weights
+models/
+
+# Data/Videos
+*.mp4
+*.avi
+*.mov
+datasets/
+
+# Logs
+*.log
+logs/
+wandb/
+runs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets
+.env
+.env.*
+secrets/
