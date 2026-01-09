@@ -1,0 +1,29 @@
+SCP quick guide for transfering data to and from Vast.ai
+========================================================
+
+Bundle and compress with tar before transfering for faster transfer times:
+  tar -czvf archive.tar.gz folder/
+  scp -P <port> archive.tar.gz root@<ip>:/remote/
+
+Unbundle and decompress:
+  tar -xzvf archive.tar.gz
+
+Get SSH info:
+  vastai ssh-url <instance_id>
+  # Returns: ssh -p <port> root@<ip>
+
+SSH into instance:
+  ssh -p <port> root@<ip>
+
+Upload file:
+  scp -P <port> /local/file.txt root@<ip>:/remote/path/
+
+Upload folder:
+  scp -P <port> -r /local/folder root@<ip>:/remote/path/
+
+Download file:
+  scp -P <port> root@<ip>:/remote/file.txt ~/local/path/
+
+Download folder:
+  scp -P <port> -r root@<ip>:/remote/folder ~/local/path/
+
