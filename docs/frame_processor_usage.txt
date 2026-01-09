@@ -1,0 +1,55 @@
+Guide to using the frame processors (applying inference models to live camera feeds) with lerobot scripts
+
+## Available Processors
+
+1. wire_detection: Detects wires of specified colors and draws bounding boxes
+
+## CLI Usage
+
+### lerobot-record ###
+```bash
+lerobot-record \
+    --robot.type=so100_follower \
+    --robot.port=/dev/tty.usbmodem... \
+    --robot.cameras="{...}" \
+    --teleop.type=so100_leader \
+    --teleop.port=/dev/tty.usbmodem... \
+    --dataset.repo_id=user/dataset \
+    --dataset.single_task="Task description" \
+    --frame-processor.type=wire_detection \
+    --frame-processor.config='{"target_colors": ["red"], "frame_stride": 2}'
+```
+
+### lerobot-teleoperate ###
+```bash
+lerobot-teleoperate \
+    --robot.type=so100_follower \
+    --robot.port=/dev/tty.usbmodem... \
+    --robot.cameras="{...}" \
+    --teleop.type=so100_leader \
+    --teleop.port=/dev/tty.usbmodem... \
+    --frame-processor.type=wire_detection \
+    --frame-processor.config='{"target_colors": ["red"]}' \
+    --display_data=true
+```
+
+## wire_detection Config Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| target_colors | list[str] | ["red"] | Colors to detect: "green", "red", "white", "yellow" |
+| frame_stride | int | 2 | Run inference every Nth frame |
+| bbox_threshold | float | 0.7 | Bounding box confidence threshold |
+| color_threshold | float | 0.8 | Color classification confidence threshold |
+| bbox_padding | int | 10 | Pixels to pad around boxes |
+| show_fps | bool | true | Show FPS overlay on frame |
+
+## YAML Config
+
+```yaml
+frame_processor:
+  type: wire_detection
+  config:
+    target_colors: ["red", "white"]
+    frame_stride: 3
+```
