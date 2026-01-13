@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vt-src"
+version = "0.1.0"
+description = "VT perception and utilities"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "torch",
+    "torchvision",
+    "ultralytics",
+    "coremltools",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
