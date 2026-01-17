@@ -29,3 +29,9 @@ Per-camera padding values for wire detection visualization:
 | `wrist_bottom` | 15px |
 
 Padding expands the detected bounding box on all sides to avoid occluding the detected object.
+
+## Bounding Box Line Thickness
+
+Line thickness: **6 pixels** (at 800x600 resolution)
+
+After resizing to 224x224 for VLA inference, this becomes ~1.7 pixels, which is visible in the model's input.

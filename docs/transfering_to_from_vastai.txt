@@ -2,7 +2,7 @@ SCP quick guide for transfering data to and from Vast.ai
 ========================================================
 
 Bundle and compress with tar before transfering for faster transfer times:
-  tar -czvf archive.tar.gz folder/
+  tar -czf archive.tar.gz folder/
   scp -P <port> archive.tar.gz root@<ip>:/remote/
 
 Unbundle and decompress:
