@@ -20,8 +20,8 @@ from ultralytics import YOLO
 
 
 # ============ DEFAULT CONFIGURATION ============
-DEFAULT_YOLO_MODEL_PATH = '/Users/elisd/Desktop/vult/models/trained_models/bounding_box_yolov11_jan9/best.pt'
-DEFAULT_COLOR_PYTORCH_PATH = '/Users/elisd/Desktop/vult/models/trained_models/wire_color_detection_imagenet_jan6/imagenet_wire_color_detection_model_jan6.pt'
+DEFAULT_YOLO_MODEL_PATH = '/Users/elisd/Desktop/vult/models.nosync/trained_models/jan9/bounding_box_yolov11_jan9/best.pt'
+DEFAULT_COLOR_PYTORCH_PATH = '/Users/elisd/Desktop/vult/models.nosync/trained_models/jan13/wire_color_detection_jan13/best_model.pt'
 DEFAULT_BBOX_THRESHOLD = 0.7
 DEFAULT_COLOR_THRESHOLD = 0.8
 DEFAULT_FRAME_STRIDE = 2
@@ -68,6 +68,8 @@ class WireDetectionPipeline:
         color_threshold: float = DEFAULT_COLOR_THRESHOLD,
         frame_stride: int = DEFAULT_FRAME_STRIDE,
         bbox_padding: int = DEFAULT_BBOX_PADDING,
+        bbox_thickness: int = 4,
+        bbox_color: tuple[int, int, int] = (255, 0, 255),  # Magenta BGR
     ):
         """
         Initialize the wire detection pipeline.
@@ -80,6 +82,7 @@ class WireDetectionPipeline:
             color_threshold: Confidence threshold for color classification
             frame_stride: Run inference every Nth frame (1 = every frame)
             bbox_padding: Pixels to pad around bounding boxes
+            bbox_thickness: Line thickness for bounding box drawing (in pixels)
         """
         # Validate colors
         self.target_colors = [c.lower() for c in target_colors]
@@ -92,6 +95,8 @@ class WireDetectionPipeline:
         self.frame_stride = frame_stride
         self.bbox_padding = bbox_padding
         self.bbox_threshold = bbox_threshold
+        self.bbox_thickness = bbox_thickness
+        self.bbox_color = bbox_color
         
         # Load yolo model (CoreML)
         self.yolo_model = self._load_yolo_coreml(bbox_model_path or DEFAULT_YOLO_MODEL_PATH)
@@ -196,7 +201,7 @@ class WireDetectionPipeline:
             frame: RGB numpy array (lerobot format)
             
         Returns:
-            List of Detection objects that match target colors
+            List containing at most one Detection (highest bbox confidence after color filter)
         """
         height, width = frame.shape[:2]
         
@@ -239,7 +244,11 @@ class WireDetectionPipeline:
                         color_confidence=color_confidence
                     ))
         
-        return detections
+        # Return only the highest bbox confidence detection
+        if detections:
+            best = max(detections, key=lambda d: d.bbox_confidence)
+            return [best]
+        return []
     
     def draw_detections(
         self,
@@ -251,14 +260,7 @@ class WireDetectionPipeline:
         dets = detections if detections is not None else []
         
         for det in dets:
-            cv2.rectangle(output, (det.x1, det.y1), (det.x2, det.y2), (0, 255, 0), 2)
-            
-            label = f"{det.color} | {det.bbox_confidence:.2f}"
-            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(output, (det.x1, det.y1 - label_size[1] - 10),
-                         (det.x1 + label_size[0], det.y1), (0, 255, 0), -1)
-            cv2.putText(output, label, (det.x1, det.y1 - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            cv2.rectangle(output, (det.x1, det.y1), (det.x2, det.y2), self.bbox_color, self.bbox_thickness)
         
         return output
     
@@ -299,3 +301,19 @@ class WireDetectionPipeline:
     def get_detections(self, camera_id: str = "default") -> list[Detection]:
         """Get the most recent cached detections for a camera."""
         return self._cached_detections.get(camera_id, [])
+    
+    def set_target_colors(self, colors: list[str]) -> None:
+        """Dynamically update target colors for detection.
+        
+        Args:
+            colors: List of colors to detect (e.g., ['red', 'white'])
+            
+        Raises:
+            ValueError: If any color is not in AVAILABLE_COLORS
+        """
+        validated = [c.lower() for c in colors]
+        for c in validated:
+            if c not in AVAILABLE_COLORS:
+                raise ValueError(f"Invalid color '{c}'. Choose from: {', '.join(AVAILABLE_COLORS)}")
+        self.target_colors = validated
+        self.reset()  # Clear cached detections

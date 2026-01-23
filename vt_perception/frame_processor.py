@@ -114,6 +114,11 @@ class FrameProcessorRegistry:
         """Reset the active processor."""
         cls._active_processor = None
         cls._initialized = False
+    
+    @classmethod
+    def get_active_processor(cls) -> "FrameProcessor | None":
+        """Return the currently active processor instance."""
+        return cls._active_processor
 
 
 # Auto-register processors when this module is imported
@@ -121,6 +126,7 @@ def _auto_register_processors():
     """Import processor modules to trigger registration."""
     try:
         from .processors import wire_detection_processor  # noqa: F401
+        from .processors import breaker_segmentation_processor  # noqa: F401
     except ImportError:
         pass
 

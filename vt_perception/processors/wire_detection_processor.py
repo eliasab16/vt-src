@@ -49,6 +49,10 @@ class WireDetectionProcessor:
         
         return self.pipeline(frame, camera_id)
     
+    def set_target_colors(self, colors: list[str]) -> None:
+        """Update target colors on the underlying pipeline."""
+        self.pipeline.set_target_colors(colors)
+    
     @classmethod
     def from_config(cls, config: dict) -> "WireDetectionProcessor":
         """Create processor from configuration dict."""
@@ -73,7 +77,9 @@ class WireDetectionProcessor:
             frame_stride=config.get("frame_stride", 2),
             bbox_threshold=config.get("bbox_threshold", 0.7),
             color_threshold=config.get("color_threshold", 0.8),
-            bbox_padding=config.get("bbox_padding", 10)  # default padding
+            bbox_padding=config.get("bbox_padding", 10),
+            bbox_thickness=config.get("bbox_thickness", 6),
+            bbox_color=tuple(config.get("bbox_color", [255, 0, 255]))  # Magenta BGR
         )
         
         return cls(pipeline, enabled_cameras, camera_padding)
