@@ -1,3 +1,4 @@
+#!/Users/elisd/miniconda3/bin/python
 import serial
 import tty
 import termios
@@ -8,22 +9,32 @@ ser = serial.Serial('/dev/cu.usbmodem101', 115200, timeout=1)
 old_settings = termios.tcgetattr(sys.stdin)
 tty.setraw(sys.stdin)
 
-print("Arrow Up = forward, Arrow Down = reverse, q = quit\r")
+print("Y-axis: 1=fwd 4=rev 7=stop | Z-axis: 2=fwd 5=rev 8=stop | Bit: 3=fwd 6=rev 9=stop | q=quit\r")
+
+CMDS = {
+    '1': ('1', 'Y fwd'),
+    '4': ('4', 'Y stop'),
+    '7': ('7', 'Y rev'),
+    '2': ('2', 'Z fwd'),
+    '5': ('5', 'Z stop'),
+    '8': ('8', 'Z rev'),
+    '3': ('3', 'Bit fwd'),
+    '6': ('6', 'Bit stop'),
+    '9': ('9', 'Bit rev'),
+}
 
 try:
     while True:
         ch = sys.stdin.read(1)
-        if ch == 'q':
+        if ch in ('q', '\x03'):
+            ser.write(b'4\n')
+            ser.write(b'5\n')
+            ser.write(b'6\n')
             break
-        if ch == '\x1b':
-            ch2 = sys.stdin.read(1)
-            ch3 = sys.stdin.read(1)
-            if ch3 == 'A':
-                ser.write(b'F\n')
-                print("Forward\r")
-            elif ch3 == 'B':
-                ser.write(b'B\n')
-                print("Reverse\r")
+        if ch in CMDS:
+            cmd, label = CMDS[ch]
+            ser.write((cmd + '\n').encode())
+            print(label + '\r')
 finally:
     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
     ser.close()
