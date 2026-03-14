@@ -5,29 +5,31 @@ import termios
 import sys
 import select
 
+# run "ls /dev/cu.usbmodem*" to find the correct port
 ser = serial.Serial('/dev/cu.usbmodem101', 115200, timeout=0.05)
 
 old_settings = termios.tcgetattr(sys.stdin)
 tty.setraw(sys.stdin)
 
-print("Bit: 1=fwd 4=stop 7=rev | Y: 2=fwd 5=stop 8=rev | Z: 3=fwd 6=stop 9=rev | q=quit\r")
+print("Bit: 1=fwd 4=stop 7=rev | Y: 2=down 5=stop 8=up | Z: 3=back 6=stop 9=front | q=quit\r")
 
 CMDS = {
     '1': ('1', 'Bit fwd'),
     '4': ('4', 'Bit stop'),
     '7': ('7', 'Bit rev'),
-    '2': ('2', 'Y fwd'),
+    '2': ('2', 'Y down'),
     '5': ('5', 'Y stop'),
-    '8': ('8', 'Y rev'),
-    '3': ('3', 'Z fwd'),
+    '8': ('8', 'Y up'),
+    '3': ('3', 'Z back'),
     '6': ('6', 'Z stop'),
-    '9': ('9', 'Z rev'),
+    '9': ('9', 'Z front'),
 }
 
 try:
     while True:
         if select.select([sys.stdin], [], [], 0)[0]:
             ch = sys.stdin.read(1)
+            
             if ch in ('q', '\x03'):
                 ser.write(b'4\n')
                 ser.write(b'5\n')
