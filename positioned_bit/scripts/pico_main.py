@@ -3,6 +3,8 @@ import sys
 import select
 from time import sleep_ms, ticks_us, ticks_diff
 
+# This script should be running on the pico. It's used to control the motors.
+
 # TMC2209 VDD power via GP7
 vdd = Pin(7, Pin.OUT)
 vdd.value(1)
@@ -77,7 +79,8 @@ while True:
         elif cmd == "6":
             z_moving = 0
             z_en.value(1)
-
+    
+    # check the limit switches for each axis and stop when triggered 
     if y_dir == 1 and y_upper_limit.value() == 0:
         y_dir = 0
         for p in y_pins:
