@@ -11,7 +11,7 @@ ser = serial.Serial('/dev/cu.usbmodem101', 115200, timeout=0.05)
 old_settings = termios.tcgetattr(sys.stdin)
 tty.setraw(sys.stdin)
 
-print("Bit: 1=fwd 4=stop 7=rev | Y: 2=down 5=stop 8=up | Z: 3=back 6=stop 9=front | q=quit\r")
+print("Bit: 1=fwd 4=stop 7=rev | Y: 2=down 5=stop 8=up | Z: 3=back 6=stop 9=front | l=laser d=tof | q=quit\r")
 
 CMDS = {
     '1': ('1', 'Bit fwd'),
@@ -31,14 +31,18 @@ try:
             ch = sys.stdin.read(1)
             
             if ch in ('q', '\x03'):
-                ser.write(b'4\n')
-                ser.write(b'5\n')
-                ser.write(b'6\n')
+                ser.write(b'4')
+                ser.write(b'5')
+                ser.write(b'6')
                 break
             if ch in CMDS:
                 cmd, label = CMDS[ch]
-                ser.write((cmd + '\n').encode())
+                ser.write(cmd.encode())
                 print(label + '\r')
+            elif ch == 'l':
+                ser.write(b'l')
+            elif ch == 'd':
+                ser.write(b'd')
 
         if ser.in_waiting:
             line = ser.readline().decode().strip()
