@@ -8,7 +8,7 @@ while True:
     ret, frame = cap.read()
     if not ret:
         break
-    frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    frame = cv2.rotate(frame, cv2.ROTATE_180)
     # h, w = frame.shape[:2]
     # start = (h - w) // 2
     # frame = frame[start:start+w, :]
