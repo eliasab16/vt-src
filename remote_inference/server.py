@@ -1,10 +1,16 @@
 import time
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket
+import torch
+from remote_inference.image_codec import decode_image_to_tensor
+import traceback
 
 from remote_inference.protocol import (
     HealthResponse,
     SetupRequest,
     SetupResponse,
+    InferenceRequest,
+    InferenceRTCRequest,
+    InferenceResponse,
 )
 
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
@@ -67,7 +73,47 @@ class InferenceServer:
 
             return SetupResponse(status="ready", message=f"Loaded {request.policy_path} on {request.device}", chunk_size=self.chunk_size)
         except Exception as e:
+            traceback.print_exc()
             return SetupResponse(status="error", message=f"{type(e).__name__}: {e}")
+
+    def infer(self, request: InferenceRequest | InferenceRTCRequest) -> InferenceResponse:
+        # 1. Build observation dict
+        obs = {}
+        obs["observation.state"] = torch.tensor(request.state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        obs["task"] = request.task
+        obs["robot_type"] = "" # for now we hardcode this since our initial model only supports one robot type; in the future we can add it as a field in the request if needed
+        for cam_name, img_b64 in request.images.items():
+            obs[f"observation.images.{cam_name}"] = decode_image_to_tensor(img_b64).to(self.device)
+
+        with torch.inference_mode():
+            # 2. Preprocess
+            obs = self.preprocessor(obs)
+            # 3. Inference
+            t0 = time.perf_counter()
+            # TODO: RTC support: pass prev_chunk_left_over, inference_delay, execution_horizon kwargs
+            # TODO: to predict_action_chunk when InferenceRTCRequest is received
+            action_chunk = self.policy.predict_action_chunk(obs)
+            t1 = time.perf_counter()
+            inference_time_ms = (t1 - t0) * 1000
+
+            # 4. save original actions (for RTC leftover tracking)
+            original_actions = action_chunk.squeeze(0).detach().cpu()
+
+            # 5. Postprocess each step individually
+            _, chunk_size, _ = action_chunk.shape
+            processed_actions = []
+            for i in range(chunk_size):
+                single_action = action_chunk[:, i, :]        # shape (1, action_dim)
+                processed = self.postprocessor(single_action)  # shape (1, action_dim)
+                processed_actions.append(processed)
+            processed_tensor = torch.stack(processed_actions, dim=1)  # shape (1, chunk_size, action_dim)
+            processed_tensor = processed_tensor.squeeze(0).detach().cpu()  # shape (chunk_size, action_dim)
+
+        return InferenceResponse(
+            actions=processed_tensor.tolist(),
+            original_actions=original_actions.tolist(),
+            inference_time_ms=inference_time_ms
+        )
 
 
 app = FastAPI(title="Remote Inference Server")
@@ -85,3 +131,20 @@ async def health() -> HealthResponse:
 @app.post("/setup", response_model=SetupResponse)
 async def setup(req: SetupRequest) -> SetupResponse:
     return server.setup(req)
+
+@app.websocket("/ws")
+async def websocket_inference(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            data = await ws.receive_text()
+            try:
+                request = InferenceRequest.model_validate_json(data)
+                response = server.infer(request)
+                await ws.send_text(response.model_dump_json())
+            except Exception as e:
+                traceback.print_exc()
+                await ws.send_text(f'{{"error": "{type(e).__name__}: {e}"}}')
+    except Exception:
+        traceback.print_exc()
+        pass  # client disconnected
