@@ -1,5 +1,11 @@
 from pydantic import BaseModel
 
+from enum import Enum
+
+class SetupStatus(str, Enum):
+    READY = "ready"
+    ERROR = "error"
+
 # client tells server which policy to load
 class SetupRequest(BaseModel):
     policy_path: str # hf repo path, e.g. "lerobot/pi0_base"
@@ -11,7 +17,7 @@ class SetupRequest(BaseModel):
 
 # server acknowledges with model metadata
 class SetupResponse(BaseModel):
-    status: str # "error", "ready"
+    status: SetupStatus # "error", "ready"
     message: str # human readable
     chunk_size: int | None = None # client must specify this
 

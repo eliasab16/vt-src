@@ -11,6 +11,7 @@ from remote_inference.protocol import (
     InferenceRequest,
     InferenceRTCRequest,
     InferenceResponse,
+    SetupStatus,
 )
 
 from lerobot.policies.pi05.modeling_pi05 import PI05Policy
@@ -71,10 +72,10 @@ class InferenceServer:
             self.postprocessor = postprocessor
             self.device = request.device
 
-            return SetupResponse(status="ready", message=f"Loaded {request.policy_path} on {request.device}", chunk_size=self.chunk_size)
+            return SetupResponse(status=SetupStatus.READY, message=f"Loaded {request.policy_path} on {request.device}", chunk_size=self.chunk_size)
         except Exception as e:
             traceback.print_exc()
-            return SetupResponse(status="error", message=f"{type(e).__name__}: {e}")
+            return SetupResponse(status=SetupStatus.ERROR, message=f"{type(e).__name__}: {e}")
 
     def infer(self, request: InferenceRequest | InferenceRTCRequest) -> InferenceResponse:
         # 1. Build observation dict
