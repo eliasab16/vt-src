@@ -1,6 +1,12 @@
 #!/bin/bash
 set -e
 
+echo "=== Checking Python version ==="
+# lerobot >= 0.5.0 requires Python 3.12+. Older Python forces pip to resolve
+# to pre-0.5.0 lerobot which lacks config fields like use_relative_actions
+# (added in PR #2970), causing model loading to fail.
+python -c "import sys; assert sys.version_info >= (3, 12), f'Python 3.12+ required (found {sys.version}). Recreate pod with a newer PyTorch template.'"
+python --version
 
 echo "=== Installing dependencies ==="
 pip install "lerobot[pi05]" fastapi uvicorn websockets

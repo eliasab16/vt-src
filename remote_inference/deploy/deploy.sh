@@ -29,6 +29,13 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REMOTE_INF_DIR="$(dirname "$SCRIPT_DIR")"
 
+# Load persisted values from .env.local (git-ignored) — skips re-prompting
+ENV_FILE="$SCRIPT_DIR/.env.local"
+if [ -f "$ENV_FILE" ]; then
+    echo "=== Loading saved values from $ENV_FILE ==="
+    set -a; source "$ENV_FILE"; set +a
+fi
+
 echo "=== Uploading remote_inference to server ==="
 rsync -avz -e "$RSYNC_SSH" \
     "$REMOTE_INF_DIR/" \
@@ -43,7 +50,11 @@ if [ -n "$IDENTITY" ]; then
 fi
 HAS_ENV=$(ssh $SSH_OPTS $USER_HOST "[ -f /root/.env ] && echo yes || echo no" 2>/dev/null)
 if [ "$HAS_ENV" = "no" ]; then
-    read -p "HF Token (required for first deploy): " HF_TOKEN
+    if [ -z "$HF_TOKEN" ]; then
+        read -p "HF Token (required for first deploy): " HF_TOKEN
+    else
+        echo "Using HF_TOKEN from .env.local"
+    fi
     if [ -n "$HF_TOKEN" ]; then
         ssh $SSH_OPTS $USER_HOST "echo 'HF_TOKEN=$HF_TOKEN' > /root/.env"
         echo "Token saved to server."
@@ -56,10 +67,13 @@ fi
 
 echo ""
 echo "=== Optional policy config ==="
-read -p "Policy path (HF repo, optional — press Enter to skip): " POLICY_PATH
-read -p "Task description (optional): " TASK_DESC
-read -p "Action dim (optional, e.g. 8): " ACTION_DIM
-read -p "Camera names, comma-separated (optional, e.g. wrist,overhead): " CAMERA_NAMES
+echo "Values are loaded from $ENV_FILE if present. Leave blank to use <PLACEHOLDERS>."
+echo "Tip: save values to $ENV_FILE to skip these prompts on future runs."
+echo ""
+[ -z "$POLICY_PATH" ] && read -p "Policy path — HuggingFace repo ID or local dir: " POLICY_PATH || echo "POLICY_PATH=$POLICY_PATH (from .env.local)"
+[ -z "$TASK_DESC" ] && read -p "Task description: " TASK_DESC || echo "TASK_DESC=$TASK_DESC (from .env.local)"
+[ -z "$ACTION_DIM" ] && read -p "Action dim (e.g. 8): " ACTION_DIM || echo "ACTION_DIM=$ACTION_DIM (from .env.local)"
+[ -z "$CAMERA_NAMES" ] && read -p "Camera names (comma-separated): " CAMERA_NAMES || echo "CAMERA_NAMES=$CAMERA_NAMES (from .env.local)"
 
 echo ""
 echo "=== Upload complete ==="
@@ -80,7 +94,9 @@ echo "4. From your MacBook, test WebSocket latency (echo-only, no inference):"
 echo "   python vt_src/remote_inference/benchmarks/ws_latency_test.py ws://$IP:$TCP_PORT/ws"
 echo "   Expected: p50 close to ping RTT (30-60ms). If >150ms, check region/proxy."
 echo ""
-echo "5. From your MacBook, load the model via /setup (one-time, ~30-60s):"
+echo "5. Model inference test (step 5.1 MUST run before 5.2):"
+echo ""
+echo "  5.1. From your MacBook, load the model via /setup (REQUIRED — ~30-60s first time):"
 # Build setup payload from user input or placeholders
 POLICY_PATH_JSON="${POLICY_PATH:-<POLICY_PATH>}"
 TASK_JSON="${TASK_DESC:-<TASK_DESCRIPTION>}"
@@ -92,11 +108,12 @@ if [ -n "$CAMERA_NAMES" ]; then
 else
     CAM_JSON='["<CAM_1>","<CAM_2>"]'
 fi
-echo "   curl -X POST http://$IP:$TCP_PORT/setup \\"
-echo "     -H 'Content-Type: application/json' \\"
-echo "     -d '{\"policy_path\":\"$POLICY_PATH_JSON\",\"action_dim\":$ACTION_DIM_JSON,\"camera_names\":$CAM_JSON,\"task\":\"$TASK_JSON\",\"device\":\"cuda\"}'"
+echo "    curl -X POST http://$IP:$TCP_PORT/setup \\"
+echo "      -H 'Content-Type: application/json' \\"
+echo "      -d '{\"policy_path\":\"$POLICY_PATH_JSON\",\"action_dim\":$ACTION_DIM_JSON,\"camera_names\":$CAM_JSON,\"task\":\"$TASK_JSON\",\"device\":\"cuda\"}'"
+echo "    (wait for status: ready before running 5.2)"
 echo ""
-echo "6. From your MacBook, run full inference benchmark (realistic payload):"
-echo "   python vt_src/remote_inference/benchmarks/ws_inference_test.py ws://$IP:$TCP_PORT/ws"
+echo "  5.2. From your MacBook, run full inference benchmark (realistic payload, model must be loaded):"
+echo "    python vt_src/remote_inference/benchmarks/ws_inference_test.py ws://$IP:$TCP_PORT/ws"
 echo "   Expected: steady-state total ~150-200ms (model ~80ms + overhead ~80ms)."
 echo ""

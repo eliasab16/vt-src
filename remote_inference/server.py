@@ -25,6 +25,7 @@ class InferenceServer:
         self.preprocessor = None
         self.postprocessor = None
         self.device = None
+        self.loaded_policy_path = None  # tracks which policy is currently loaded
 
     @property
     def chunk_size(self) -> int | None:
@@ -46,6 +47,18 @@ class InferenceServer:
         return time.perf_counter() - self.start_time
     
     def setup(self, request: SetupRequest) -> SetupResponse:
+        # Skip reload if the same policy is already loaded on the same device
+        if (
+            self.ready
+            and self.loaded_policy_path == request.policy_path
+            and self.device == request.device
+        ):
+            return SetupResponse(
+                status=SetupStatus.READY,
+                message=f"Policy already loaded: {request.policy_path} on {request.device}",
+                chunk_size=self.chunk_size,
+            )
+
         try:
             # 1. Load and setup policy
             policy = PI05Policy.from_pretrained(request.policy_path)
@@ -71,6 +84,7 @@ class InferenceServer:
             self.preprocessor = preprocessor
             self.postprocessor = postprocessor
             self.device = request.device
+            self.loaded_policy_path = request.policy_path
 
             return SetupResponse(status=SetupStatus.READY, message=f"Loaded {request.policy_path} on {request.device}", chunk_size=self.chunk_size)
         except Exception as e:
