@@ -11,6 +11,7 @@ Manages two threads:
 2. Inference thread (background): continuously reads the latest observation, sends to server, merges the returned chunk into the queue.
 """
 
+import json
 import threading
 import time
 import torch
@@ -18,6 +19,7 @@ from torch import Tensor
 
 from websockets.sync.client import connect as ws_connect
 import requests
+from websockets.exceptions import ConnectionClosed
 
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 from lerobot.policies.rtc.action_queue import ActionQueue
@@ -27,6 +29,7 @@ from remote_inference.protocol import (
     SetupRequest,
     SetupResponse,
     InferenceRequest,
+    InferenceRTCRequest,
     InferenceResponse,
     SetupStatus,
 )
@@ -44,6 +47,12 @@ class RemoteInferenceClient:
         self._inference_thread: threading.Thread | None = None
         self._latest_obs: dict | None = None
         self._obs_lock = threading.Lock()  # protects _latest_obs
+        self._action_queue: ActionQueue | None = None
+        self._latency_tracker = LatencyTracker()
+        self._safety_margin_frames = 15  # ~0.5s at 30Hz buffer to absorb latency spikes
+        self._min_queue_threshold = 12  # always keep at least 12 actions queued (~400ms at 30Hz)
+        self._max_queue_threshold = 30  # never buffer more than 30 actions (~1s — prevents staleness)
+        self._warmup_latency_cutoff_s = 1.0  # ignore inferences slower than this in latency tracker
 
     def setup(self, policy_path, action_dim, camera_names, task, device):
         setup_request = SetupRequest(
@@ -79,36 +88,148 @@ class RemoteInferenceClient:
         self.chunk_size = setup_response.chunk_size
         print(f"Server setup successful. Chunk size: {self.chunk_size}")
 
+        self._action_queue = ActionQueue(
+            cfg=self.rtc_config if self.rtc_config is not None else RTCConfig(),
+        )
+
     def start(self):
         if self._running.is_set():
             print("Inference thread already running.")
             return
         
-        self.ws = ws_connect(f"{self.server_url}/ws", open_timeout=30)
+        # ping_interval=None disables client-side keepalive pings — otherwise a slow
+        # first-time warmup inference (30-60s) would cause the connection to be killed
+        # before the response arrives.
+        self.ws = ws_connect(
+            f"{self.server_url}/ws",
+            open_timeout=200,
+            ping_interval=None,
+        )
         self._running.set()
         self._inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
         self._inference_thread.start()
 
     def stop(self):
         self._running.clear()
-        if self._inference_thread:
-            self._inference_thread.join(timeout=5)
         if self.ws:
             self.ws.close()
-            self.ws = None
+        if self._inference_thread:
+            self._inference_thread.join(timeout=5)
+        self.ws = None
 
+    # called by main thread each frame. Encodes images, stores latest in a shared slot.
     def update_observation(self, state, images, task):
-        # called by main thread each frame. Encodes images, stores latest in a shared slot.
-        self.state = state
-        self.images = images
-        self.task = task
+        with self._obs_lock:
+            self._latest_obs = {
+                "state": state,
+                "images": images,
+                "task": task,
+            }
 
     def get_action(self) -> Tensor | None:
-        pass
+        if self._action_queue is None:
+            return None
+        return self._action_queue.get()
+
 
     def clear_queue(self):
-        pass
+        if self._action_queue is not None:
+            self._action_queue.clear()
+
+    def _build_request(self, obs: dict) -> InferenceRequest | InferenceRTCRequest:
+        """Build the appropriate request type based on RTC config."""
+        base_fields = {
+            "state": obs["state"],
+            "images": {name: encode_image(img) for name, img in obs["images"].items()},
+            "task": obs["task"],
+            "timestamp": time.perf_counter(),
+        }
+
+        if self.rtc_config is None or not self.rtc_config.enabled:
+            return InferenceRequest(**base_fields)
+        
+        leftover = self._action_queue.get_left_over()
+        if leftover is None or len(leftover) == 0:
+            # First call — no previous chunk to align to. Use non-RTC endpoint.
+            return InferenceRequest(**base_fields)
+
+        return InferenceRTCRequest(
+            **base_fields,
+            prev_chunk_left_over=leftover.tolist(),
+            inference_delay=int((self._latency_tracker.percentile(0.5)) * self.fps),
+            execution_horizon=self.rtc_config.execution_horizon,
+        )
+
 
     def _inference_loop(self):
+        """Background thread: pull latest obs, send to server, merge returned chunk into queue."""
+        iteration = 0
         while self._running.is_set():
-            time.sleep(0.01)  # placeholder
+            # 1. Grab latest observation (atomic swap — pop it so we don't re-send)
+            with self._obs_lock:
+                obs = self._latest_obs
+                self._latest_obs = None
+
+            if obs is None:
+                time.sleep(0.005)  # nothing to process, short sleep
+                continue
+
+            # Throttle: skip inference if queue has enough actions to cover the next inference cycle.
+            # Threshold adapts to observed p95 latency + safety margin, clamped to [min, max].
+            p95_latency_s = self._latency_tracker.percentile(0.95) or 0.2  # default 200ms if no samples
+            raw_threshold = int(p95_latency_s * self.fps) + self._safety_margin_frames
+            threshold = max(self._min_queue_threshold, min(raw_threshold, self._max_queue_threshold))
+            if self._action_queue.qsize() > threshold:
+                time.sleep(0.005)
+                continue
+
+            iteration += 1
+
+            # 2. Build InferenceRequest (encoding happens here, inside the inference thread)
+            t_encode_start = time.perf_counter()
+            inference_request = self._build_request(obs)
+
+            encode_ms = (time.perf_counter() - t_encode_start) * 1000
+
+            # 3. Send + receive
+            action_index_before_inference = self._action_queue.get_action_index() if self._action_queue else None
+            t_rtt_start = time.perf_counter()
+            try:
+                self.ws.send(inference_request.model_dump_json())
+                try:
+                    response_text = self.ws.recv()
+                except ConnectionClosed:
+                    break  # stop() closed the WebSocket
+                payload = json.loads(response_text)
+                if "error" in payload:
+                    print(f"[inference thread] server error: {payload['error']}")
+                    continue
+                response = InferenceResponse.model_validate(payload)
+            except Exception as e:
+                print(f"[inference thread] request/response error: {type(e).__name__}: {e}")
+                continue
+            rtt_ms = (time.perf_counter() - t_rtt_start) * 1000
+            overhead_ms = rtt_ms - response.inference_time_ms
+            # Exclude warmup outliers (first few CUDA-compile inferences) from latency tracker
+            if rtt_ms / 1000 < self._warmup_latency_cutoff_s:
+                self._latency_tracker.add(rtt_ms / 1000)
+
+            # 4. Merge received action chunk into ActionQueue
+            real_delay = self._action_queue.get_action_index() - action_index_before_inference if action_index_before_inference is not None else 0
+            processed_actions = torch.tensor(response.actions)
+            original_actions = torch.tensor(response.original_actions)
+            self._action_queue.merge(
+                original_actions=original_actions,
+                processed_actions=processed_actions,
+                real_delay=real_delay,
+                action_index_before_inference=action_index_before_inference,
+            )
+
+            print(
+                f"[inference #{iteration}] "
+                f"encode={encode_ms:.0f}ms | "
+                f"model={response.inference_time_ms:.0f}ms | "
+                f"overhead={overhead_ms:.0f}ms | "
+                f"total={rtt_ms:.0f}ms | "
+                f"queue={self._action_queue.qsize()}"
+            )
