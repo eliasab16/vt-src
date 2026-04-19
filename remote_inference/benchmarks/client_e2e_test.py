@@ -8,6 +8,9 @@ Simulates a 30Hz main robot control loop without actual hardware:
 Usage:
     python client_e2e_test.py <server-ip> <server-tcp-port> <policy-path> [duration_s]
 
+Example:
+    python client_e2e_test.py 203.57.40.240 10049 eliasab16/pi05_wire_tip_p1_4k 10
+"""
 
 import sys
 import time
@@ -33,7 +36,9 @@ FRAME_PERIOD = 1.0 / FPS
 
 # --- Setup ---
 print(f"Connecting to {SERVER_URL}...")
-client = RemoteInferenceClient(server_url=SERVER_URL, fps=FPS)
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+rtc_config = RTCConfig(enabled=True, execution_horizon=20)
+client = RemoteInferenceClient(server_url=SERVER_URL, fps=FPS, rtc_config=rtc_config)
 
 print(f"Loading policy: {POLICY_PATH}")
 client.setup(

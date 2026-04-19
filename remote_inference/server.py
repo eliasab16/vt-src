@@ -3,6 +3,7 @@ from fastapi import FastAPI, WebSocket
 import torch
 from remote_inference.image_codec import decode_image_to_tensor
 import traceback
+import json
 
 from remote_inference.protocol import (
     HealthResponse,
@@ -91,7 +92,7 @@ class InferenceServer:
             traceback.print_exc()
             return SetupResponse(status=SetupStatus.ERROR, message=f"{type(e).__name__}: {e}")
 
-    def infer(self, request: InferenceRequest | InferenceRTCRequest) -> InferenceResponse:
+    def inference(self, request: InferenceRequest | InferenceRTCRequest) -> InferenceResponse:
         # 1. Build observation dict
         obs = {}
         obs["observation.state"] = torch.tensor(request.state, dtype=torch.float32).unsqueeze(0).to(self.device)
@@ -100,21 +101,31 @@ class InferenceServer:
         for cam_name, img_b64 in request.images.items():
             obs[f"observation.images.{cam_name}"] = decode_image_to_tensor(img_b64).to(self.device)
 
+
+        # 2. Optional RTC kwargs - only when request is RTC-typed with a leftover
+        rtc_kwargs = {}
+        if isinstance(request, InferenceRTCRequest) and request.prev_chunk_left_over is not None:
+            rtc_kwargs["prev_chunk_left_over"] = (
+                torch.tensor(request.prev_chunk_left_over, dtype=torch.float32)
+                .unsqueeze(0)
+                .to(self.device)
+            )
+            rtc_kwargs["inference_delay"] = request.inference_delay
+            rtc_kwargs["execution_horizon"] = request.execution_horizon
+
         with torch.inference_mode():
-            # 2. Preprocess
+            # 3. Preprocess
             obs = self.preprocessor(obs)
-            # 3. Inference
+            # 4. Inference
             t0 = time.perf_counter()
-            # TODO: RTC support: pass prev_chunk_left_over, inference_delay, execution_horizon kwargs
-            # TODO: to predict_action_chunk when InferenceRTCRequest is received
-            action_chunk = self.policy.predict_action_chunk(obs)
+            action_chunk = self.policy.predict_action_chunk(obs, **rtc_kwargs)
             t1 = time.perf_counter()
             inference_time_ms = (t1 - t0) * 1000
 
-            # 4. save original actions (for RTC leftover tracking)
+            # 5. save original actions (for RTC leftover tracking)
             original_actions = action_chunk.squeeze(0).detach().cpu()
 
-            # 5. Postprocess each step individually
+            # 6. Postprocess each step individually
             _, chunk_size, _ = action_chunk.shape
             processed_actions = []
             for i in range(chunk_size):
@@ -154,8 +165,14 @@ async def websocket_inference(ws: WebSocket):
         while True:
             data = await ws.receive_text()
             try:
-                request = InferenceRequest.model_validate_json(data)
-                response = server.infer(request)
+                payload = json.loads(data)
+                if "prev_chunk_left_over" in payload:
+                    # if the request has RTC fields, validate as InferenceRTCRequest
+                    request = InferenceRTCRequest.model_validate(payload)
+                else:
+                    request = InferenceRequest.model_validate(payload)
+                response = server.inference(request)
+
                 await ws.send_text(response.model_dump_json())
             except Exception as e:
                 traceback.print_exc()
