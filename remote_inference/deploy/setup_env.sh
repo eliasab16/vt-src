@@ -9,15 +9,28 @@ python -c "import sys; assert sys.version_info >= (3, 12), f'Python 3.12+ requir
 python --version
 
 echo "=== Installing dependencies ==="
-pip install "lerobot[pi05]" fastapi uvicorn websockets
-pip install transformers==5.3.0
+# Pinned versions known to work together with lerobot 0.5.1.
+pip install \
+    "lerobot[pi05]==0.5.1" \
+    "transformers==5.3.0" \
+    "huggingface-hub>=1.3.0,<2.0.0" \
+    fastapi uvicorn websockets
 
 echo "=== Validating imports ==="
-python -c "from lerobot.policies.pi05.modeling_pi05 import PI05Policy; print('lerobot PI05: ok')"
-python -c "from lerobot.policies.factory import make_pre_post_processors; print('lerobot factory: ok')"
-python -c "import transformers; print(f'transformers: {transformers.__version__}')"
-python -c "from transformers import CONFIG_MAPPING; assert CONFIG_MAPPING['paligemma'] is not None; print('paligemma config: ok')"
-python -c "import torch; print(f'torch: {torch.__version__}, cuda: {torch.cuda.is_available()}')"
+# One Python process, not five — avoids re-importing torch/transformers 5x.
+python - <<'PY'
+from lerobot.policies.pi05.modeling_pi05 import PI05Policy
+print("lerobot PI05: ok")
+from lerobot.policies.factory import make_pre_post_processors
+print("lerobot factory: ok")
+import transformers
+print(f"transformers: {transformers.__version__}")
+from transformers import CONFIG_MAPPING
+assert CONFIG_MAPPING["paligemma"] is not None
+print("paligemma config: ok")
+import torch
+print(f"torch: {torch.__version__}, cuda: {torch.cuda.is_available()}")
+PY
 
 echo "=== HuggingFace auth ==="
 if [ -f /root/.env ]; then

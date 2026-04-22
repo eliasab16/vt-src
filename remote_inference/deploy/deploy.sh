@@ -22,8 +22,10 @@ if [ -z "$PORT" ]; then
 fi
 
 RSYNC_SSH="ssh -p $PORT"
+SSH_OPTS="-p $PORT"
 if [ -n "$IDENTITY" ]; then
     RSYNC_SSH="ssh -p $PORT -i $IDENTITY"
+    SSH_OPTS="-p $PORT -i $IDENTITY"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -36,6 +38,11 @@ if [ -f "$ENV_FILE" ]; then
     set -a; source "$ENV_FILE"; set +a
 fi
 
+echo "=== Ensuring rsync is installed on server ==="
+# Fresh pod images often ship without rsync; install it before the upload step.
+ssh $SSH_OPTS $USER_HOST "command -v rsync >/dev/null 2>&1 || (apt-get update && apt-get install -y rsync)"
+
+echo ""
 echo "=== Uploading remote_inference to server ==="
 rsync -avz -e "$RSYNC_SSH" \
     "$REMOTE_INF_DIR/" \
@@ -44,10 +51,6 @@ rsync -avz -e "$RSYNC_SSH" \
 echo ""
 echo "=== Setting up HF token ==="
 # Check if .env already exists on server
-SSH_OPTS="-p $PORT"
-if [ -n "$IDENTITY" ]; then
-    SSH_OPTS="-p $PORT -i $IDENTITY"
-fi
 HAS_ENV=$(ssh $SSH_OPTS $USER_HOST "[ -f /root/.env ] && echo yes || echo no" 2>/dev/null)
 if [ "$HAS_ENV" = "no" ]; then
     if [ -z "$HF_TOKEN" ]; then

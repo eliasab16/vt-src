@@ -80,7 +80,18 @@ class InferenceServer:
                 postprocessor_overrides={"device_processor": device_override},
             )
 
-            # 3. now we set all the server states (after all the above steps succeeded without exceptions)
+            # 3. Warmup CUDA kernels — runs a non-RTC and an RTC dummy inference so the
+            # first real request is fast instead of eating a 20s+ kernel compilation hit.
+            try:
+                self._warmup(policy, preprocessor, request.camera_names, request.action_dim, request.device)
+            except Exception as warmup_err:
+                traceback.print_exc()
+                return SetupResponse(
+                    status=SetupStatus.ERROR,
+                    message=f"Warmup failed: {type(warmup_err).__name__}: {warmup_err}",
+                )
+
+            # 4. now we set all the server states (after all the above steps succeeded without exceptions)
             self.policy = policy
             self.preprocessor = preprocessor
             self.postprocessor = postprocessor
@@ -91,6 +102,54 @@ class InferenceServer:
         except Exception as e:
             traceback.print_exc()
             return SetupResponse(status=SetupStatus.ERROR, message=f"{type(e).__name__}: {e}")
+
+    def _warmup(self, policy, preprocessor, camera_names, action_dim, device):
+        """Run dummy inferences to pre-compile CUDA kernels (non-RTC + RTC paths).
+
+        Both kernel paths are compiled here so the first real /infer request
+        doesn't trigger a ~20s kernel compilation hit (which otherwise drains
+        the client's action queue during warmup).
+        """
+        # Use the robot's actual dim (not policy.config.max_*_dim) — normalizer stats
+        # are sized to the real dim, so passing the padded max breaks broadcasting.
+        state_dim = action_dim
+        chunk_size = policy.config.chunk_size
+
+        # Build dummy observation. Image shape mirrors what the client sends:
+        # aspect-preserving, non-square — so resize_with_pad_torch runs (same path as real requests).
+        obs = {
+            "observation.state": torch.zeros(1, state_dim, dtype=torch.float32).to(device),
+            "task": "warmup",
+            "robot_type": "",
+        }
+        for cam_name in camera_names:
+            obs[f"observation.images.{cam_name}"] = torch.zeros(
+                1, 3, 168, 224, dtype=torch.float32
+            ).to(device)
+
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            processed_obs = preprocessor(obs)
+
+            # Non-RTC kernel path
+            _ = policy.predict_action_chunk(processed_obs)
+
+            # RTC kernel path — fake prev_chunk_left_over so the RTC path compiles too
+            fake_leftover = torch.zeros(
+                1, chunk_size - 5, action_dim, dtype=torch.float32
+            ).to(device)
+            _ = policy.predict_action_chunk(
+                processed_obs,
+                prev_chunk_left_over=fake_leftover,
+                inference_delay=5,
+                execution_horizon=20,
+            )
+        # Reset any internal policy state that accumulated during warmup
+        # (e.g., action queues, attention caches the policy might maintain).
+        policy.reset()
+
+        elapsed_s = time.perf_counter() - t0
+        print(f"Warmup complete ({elapsed_s:.1f}s) — non-RTC + RTC kernels compiled.")
 
     def inference(self, request: InferenceRequest | InferenceRTCRequest) -> InferenceResponse:
         # 1. Build observation dict

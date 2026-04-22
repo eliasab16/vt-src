@@ -11,11 +11,15 @@ Manages two threads:
 2. Inference thread (background): continuously reads the latest observation, sends to server, merges the returned chunk into the queue.
 """
 
+import csv
 import json
 import threading
 import time
+from collections import deque
 import torch
 from torch import Tensor
+
+_LOG_SEPARATOR = "─" * 80
 
 from websockets.sync.client import connect as ws_connect
 import requests
@@ -43,9 +47,9 @@ class RemoteInferenceClient:
             server_url,
             fps,
             rtc_config: RTCConfig | None = None,
-            min_queue_threshold: int = 8,
-            max_queue_threshold: int = 15,
-            safety_margin_frames: int = 10,
+            queue_threshold: int = 15,
+            log_actions_csv: str | None = None,
+            joint_names: list[str] | None = None,
     ):
         self.server_url = server_url
         self.fps = fps
@@ -57,10 +61,22 @@ class RemoteInferenceClient:
         self._obs_lock = threading.Lock()  # protects _latest_obs
         self._action_queue: ActionQueue | None = None
         self._latency_tracker = LatencyTracker()
-        self._safety_margin_frames = safety_margin_frames  # ~0.33s at 30Hz buffer to absorb latency spikes
-        self._min_queue_threshold = min_queue_threshold  # always keep at least 8 actions queued (~0.27s)
-        self._max_queue_threshold = max_queue_threshold  # never buffer more than 15 actions (~0.5s) — keeps policy reactive to fresh obs
+        self._queue_threshold = queue_threshold
         self._warmup_latency_cutoff_s = 1.0  # ignore inferences slower than this in latency tracker
+
+        # Chunk-tagging bookkeeping: parallel to ActionQueue, tracks which actions
+        # belong to which chunk so we can log chunk boundaries / transitions.
+        self._chunk_counter = 0
+        self._pending_chunks: deque = deque()
+        self._chunks_lock = threading.Lock()
+        self._t_start: float | None = None  # set in start()
+
+        # Per-action CSV logging (one row per popped action).
+        self._log_actions_csv_path = log_actions_csv
+        self._joint_names = joint_names
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_lock = threading.Lock()
 
     def setup(self, policy_path, action_dim, camera_names, task, device):
         setup_request = SetupRequest(
@@ -114,6 +130,15 @@ class RemoteInferenceClient:
             ping_interval=None,
         )
         self._running.set()
+        self._t_start = time.perf_counter()
+
+        # Open per-action CSV if configured. Header is written lazily on first
+        # row so we can size motor columns to the actual action_dim.
+        if self._log_actions_csv_path is not None:
+            self._csv_file = open(self._log_actions_csv_path, "w", newline="")
+            self._csv_writer = csv.writer(self._csv_file)
+            print(f"[client] logging per-action positions to {self._log_actions_csv_path}", flush=True)
+
         self._inference_thread = threading.Thread(target=self._inference_loop, daemon=True)
         self._inference_thread.start()
 
@@ -124,6 +149,11 @@ class RemoteInferenceClient:
         if self._inference_thread:
             self._inference_thread.join(timeout=5)
         self.ws = None
+        with self._csv_lock:
+            if self._csv_file is not None:
+                self._csv_file.close()
+                self._csv_file = None
+                self._csv_writer = None
 
     # called by main thread each frame. Encodes images, stores latest in a shared slot.
     def update_observation(self, state, images, task):
@@ -137,12 +167,77 @@ class RemoteInferenceClient:
     def get_action(self) -> Tensor | None:
         if self._action_queue is None:
             return None
-        return self._action_queue.get()
+        action = self._action_queue.get()
+        if action is None:
+            return None
+
+        # Track consumption of the head chunk; log transition when it's exhausted.
+        chunk_id_for_csv = None
+        action_idx_for_csv = None
+        chunk_fire_ms_for_csv = None
+        with self._chunks_lock:
+            if self._pending_chunks:
+                head = self._pending_chunks[0]
+                chunk_id_for_csv = head["chunk_id"]
+                action_idx_for_csv = head["chunk_len"] - head["remaining"]
+                chunk_fire_ms_for_csv = head["fire_time_ms"]
+                head["remaining"] -= 1
+
+                if head["remaining"] == 0:
+                    next_chunk = self._pending_chunks[1] if len(self._pending_chunks) > 1 else None
+                    if next_chunk is not None and self._t_start is not None:
+                        t_rel = (time.perf_counter() - self._t_start) * 1000
+                        first_new_action = next_chunk["actions"][0]
+                        print(_LOG_SEPARATOR, flush=True)
+                        print(
+                            f"[transition @ t={t_rel:.0f}ms]  chunk_{head['chunk_id']} → chunk_{next_chunk['chunk_id']}",
+                            flush=True,
+                        )
+                        print(
+                            f"  last action (chunk_{head['chunk_id']}):  {[f'{v:+.3f}' for v in action.tolist()]}",
+                            flush=True,
+                        )
+                        print(
+                            f"  first action (chunk_{next_chunk['chunk_id']}): {[f'{v:+.3f}' for v in first_new_action.tolist()]}",
+                            flush=True,
+                        )
+                    self._pending_chunks.popleft()
+
+        # Per-action CSV row (one row per popped action, for post-hoc analysis).
+        if self._csv_writer is not None and self._t_start is not None:
+            with self._csv_lock:
+                if self._csv_writer is None:  # double-check inside lock (stop() may have closed it)
+                    return action
+                t_ms = (time.perf_counter() - self._t_start) * 1000
+                action_list = action.tolist()
+                # Lazy header: write once we know the action_dim.
+                if self._csv_file.tell() == 0:
+                    motor_cols = (
+                        self._joint_names
+                        if self._joint_names is not None and len(self._joint_names) == len(action_list)
+                        else [f"m{i}" for i in range(len(action_list))]
+                    )
+                    self._csv_writer.writerow(
+                        ["t_ms", "chunk_id", "action_idx", "chunk_fire_ms", "age_ms", *motor_cols]
+                    )
+                age_ms = t_ms - chunk_fire_ms_for_csv if chunk_fire_ms_for_csv is not None else ""
+                self._csv_writer.writerow([
+                    f"{t_ms:.2f}",
+                    chunk_id_for_csv if chunk_id_for_csv is not None else "",
+                    action_idx_for_csv if action_idx_for_csv is not None else "",
+                    f"{chunk_fire_ms_for_csv:.2f}" if chunk_fire_ms_for_csv is not None else "",
+                    f"{age_ms:.2f}" if age_ms != "" else "",
+                    *[f"{v:.4f}" for v in action_list],
+                ])
+
+        return action
 
 
     def clear_queue(self):
         if self._action_queue is not None:
             self._action_queue.clear()
+        with self._chunks_lock:
+            self._pending_chunks.clear()
 
     def _build_request(self, obs: dict) -> InferenceRequest | InferenceRTCRequest:
         """Build the appropriate request type based on RTC config."""
@@ -171,9 +266,6 @@ class RemoteInferenceClient:
 
     def _inference_loop(self):
         """Background thread: pull latest obs, send to server, merge returned chunk into queue."""
-        iteration = 0
-        skipped_throttle = 0          # throttle skips since last log line
-        t_prev_inference_end = None   # wall-clock end of previous inference (for inter-inference dt)
         while self._running.is_set():
             # 1. Grab latest observation (atomic swap — pop it so we don't re-send)
             with self._obs_lock:
@@ -181,83 +273,81 @@ class RemoteInferenceClient:
                 self._latest_obs = None
 
             if obs is None:
-                time.sleep(0.005)  # nothing to process, short sleep
-                continue
-
-            # Throttle: skip inference if queue has enough actions to cover the next inference cycle.
-            # Threshold adapts to observed p95 latency + safety margin, clamped to [min, max].
-            p95_latency_s = self._latency_tracker.percentile(0.95) or 0.2  # default 200ms if no samples
-            raw_threshold = int(p95_latency_s * self.fps) + self._safety_margin_frames
-            threshold = max(self._min_queue_threshold, min(raw_threshold, self._max_queue_threshold))
-            qsize_at_gate = self._action_queue.qsize()
-            if qsize_at_gate > threshold:
-                skipped_throttle += 1
                 time.sleep(0.005)
                 continue
 
-            iteration += 1
-            t_loop_start = time.perf_counter()
-            dt_since_prev_ms = (t_loop_start - t_prev_inference_end) * 1000 if t_prev_inference_end is not None else 0.0
+            # Throttle: skip inference until the queue drops to the configured threshold.
+            if self._action_queue.qsize() > self._queue_threshold:
+                time.sleep(0.005)
+                continue
 
-            # 2. Build InferenceRequest (encoding happens here, inside the inference thread)
-            t_encode_start = time.perf_counter()
+            # Snapshot what the main thread is currently executing, so we can
+            # later report which action-within-chunk was being executed at fire time.
+            with self._chunks_lock:
+                if self._pending_chunks:
+                    head = self._pending_chunks[0]
+                    exec_chunk_id = head["chunk_id"]
+                    exec_action_idx = head["chunk_len"] - head["remaining"]
+                    exec_chunk_len = head["chunk_len"]
+                else:
+                    exec_chunk_id, exec_action_idx, exec_chunk_len = None, None, None
+
+            t_fire = time.perf_counter()
+            t_fire_rel_ms = (t_fire - self._t_start) * 1000 if self._t_start is not None else 0.0
+
+            # 2. Build + send inference request
             inference_request = self._build_request(obs)
-
-            encode_ms = (time.perf_counter() - t_encode_start) * 1000
-
-            # 3. Send + receive
             action_index_before_inference = self._action_queue.get_action_index() if self._action_queue else None
-            qsize_pre_request = self._action_queue.qsize()
-            t_rtt_start = time.perf_counter()
             try:
                 self.ws.send(inference_request.model_dump_json())
                 try:
                     response_text = self.ws.recv()
                 except ConnectionClosed:
-                    break  # stop() closed the WebSocket
+                    break
                 payload = json.loads(response_text)
                 if "error" in payload:
-                    print(f"[inference thread] server error: {payload['error']}")
+                    print(f"[inference thread] server error: {payload['error']}", flush=True)
                     continue
                 response = InferenceResponse.model_validate(payload)
             except Exception as e:
-                print(f"[inference thread] request/response error: {type(e).__name__}: {e}")
+                print(f"[inference thread] request/response error: {type(e).__name__}: {e}", flush=True)
                 continue
-            rtt_ms = (time.perf_counter() - t_rtt_start) * 1000
-            overhead_ms = rtt_ms - response.inference_time_ms
-            # Exclude warmup outliers (first few CUDA-compile inferences) from latency tracker
+            rtt_ms = (time.perf_counter() - t_fire) * 1000
             if rtt_ms / 1000 < self._warmup_latency_cutoff_s:
                 self._latency_tracker.add(rtt_ms / 1000)
 
-            # 4. Merge received action chunk into ActionQueue
+            # 3. Merge into ActionQueue
             real_delay = self._action_queue.get_action_index() - action_index_before_inference if action_index_before_inference is not None else 0
             processed_actions = torch.tensor(response.actions)
             original_actions = torch.tensor(response.original_actions)
-            qsize_pre_merge = self._action_queue.qsize()
-            chunk_len = processed_actions.shape[0] if processed_actions.dim() > 1 else 1
             self._action_queue.merge(
                 original_actions=original_actions,
                 processed_actions=processed_actions,
                 real_delay=real_delay,
                 action_index_before_inference=action_index_before_inference,
             )
-            qsize_post_merge = self._action_queue.qsize()
 
-            t_prev_inference_end = time.perf_counter()
+            # 4. Register this chunk for main-thread chunk-transition tracking
+            with self._chunks_lock:
+                self._chunk_counter += 1
+                new_chunk_id = self._chunk_counter
+                chunk_len_int = processed_actions.shape[0]
+                self._pending_chunks.append({
+                    "chunk_id": new_chunk_id,
+                    "remaining": chunk_len_int,
+                    "chunk_len": chunk_len_int,
+                    "fire_time_ms": t_fire_rel_ms,
+                    "actions": processed_actions.clone(),
+                })
 
+            # 5. Log fire event
+            exec_desc = (
+                f"executing chunk_{exec_chunk_id} action {exec_action_idx}/{exec_chunk_len}"
+                if exec_chunk_id is not None
+                else "queue empty"
+            )
+            print(_LOG_SEPARATOR, flush=True)
             print(
-                f"[inference #{iteration}] "
-                f"dt_inter={dt_since_prev_ms:.0f}ms | "
-                f"encode={encode_ms:.0f}ms | "
-                f"model={response.inference_time_ms:.0f}ms | "
-                f"overhead={overhead_ms:.0f}ms | "
-                f"total={rtt_ms:.0f}ms | "
-                f"real_delay={real_delay} | "
-                f"thresh={threshold} | "
-                f"q_gate={qsize_at_gate} pre={qsize_pre_request} premerge={qsize_pre_merge} post={qsize_post_merge} "
-                f"delta={qsize_post_merge - qsize_pre_merge:+d} | "
-                f"chunk={chunk_len} | "
-                f"skips={skipped_throttle}",
+                f"[fire chunk_{new_chunk_id} @ t={t_fire_rel_ms:.0f}ms]  rtt={rtt_ms:.0f}ms  {exec_desc}",
                 flush=True,
             )
-            skipped_throttle = 0
