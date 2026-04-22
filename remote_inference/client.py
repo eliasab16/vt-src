@@ -38,7 +38,15 @@ from remote_inference.image_codec import encode_image
 
 
 class RemoteInferenceClient:
-    def __init__(self, server_url, fps, rtc_config: RTCConfig | None = None):
+    def __init__(
+            self,
+            server_url,
+            fps,
+            rtc_config: RTCConfig | None = None,
+            min_queue_threshold: int = 8,
+            max_queue_threshold: int = 15,
+            safety_margin_frames: int = 10,
+    ):
         self.server_url = server_url
         self.fps = fps
         self.rtc_config = rtc_config
@@ -49,9 +57,9 @@ class RemoteInferenceClient:
         self._obs_lock = threading.Lock()  # protects _latest_obs
         self._action_queue: ActionQueue | None = None
         self._latency_tracker = LatencyTracker()
-        self._safety_margin_frames = 15  # ~0.5s at 30Hz buffer to absorb latency spikes
-        self._min_queue_threshold = 12  # always keep at least 12 actions queued (~400ms at 30Hz)
-        self._max_queue_threshold = 30  # never buffer more than 30 actions (~1s — prevents staleness)
+        self._safety_margin_frames = safety_margin_frames  # ~0.33s at 30Hz buffer to absorb latency spikes
+        self._min_queue_threshold = min_queue_threshold  # always keep at least 8 actions queued (~0.27s)
+        self._max_queue_threshold = max_queue_threshold  # never buffer more than 15 actions (~0.5s) — keeps policy reactive to fresh obs
         self._warmup_latency_cutoff_s = 1.0  # ignore inferences slower than this in latency tracker
 
     def setup(self, policy_path, action_dim, camera_names, task, device):
@@ -164,6 +172,8 @@ class RemoteInferenceClient:
     def _inference_loop(self):
         """Background thread: pull latest obs, send to server, merge returned chunk into queue."""
         iteration = 0
+        skipped_throttle = 0          # throttle skips since last log line
+        t_prev_inference_end = None   # wall-clock end of previous inference (for inter-inference dt)
         while self._running.is_set():
             # 1. Grab latest observation (atomic swap — pop it so we don't re-send)
             with self._obs_lock:
@@ -179,11 +189,15 @@ class RemoteInferenceClient:
             p95_latency_s = self._latency_tracker.percentile(0.95) or 0.2  # default 200ms if no samples
             raw_threshold = int(p95_latency_s * self.fps) + self._safety_margin_frames
             threshold = max(self._min_queue_threshold, min(raw_threshold, self._max_queue_threshold))
-            if self._action_queue.qsize() > threshold:
+            qsize_at_gate = self._action_queue.qsize()
+            if qsize_at_gate > threshold:
+                skipped_throttle += 1
                 time.sleep(0.005)
                 continue
 
             iteration += 1
+            t_loop_start = time.perf_counter()
+            dt_since_prev_ms = (t_loop_start - t_prev_inference_end) * 1000 if t_prev_inference_end is not None else 0.0
 
             # 2. Build InferenceRequest (encoding happens here, inside the inference thread)
             t_encode_start = time.perf_counter()
@@ -193,6 +207,7 @@ class RemoteInferenceClient:
 
             # 3. Send + receive
             action_index_before_inference = self._action_queue.get_action_index() if self._action_queue else None
+            qsize_pre_request = self._action_queue.qsize()
             t_rtt_start = time.perf_counter()
             try:
                 self.ws.send(inference_request.model_dump_json())
@@ -218,18 +233,31 @@ class RemoteInferenceClient:
             real_delay = self._action_queue.get_action_index() - action_index_before_inference if action_index_before_inference is not None else 0
             processed_actions = torch.tensor(response.actions)
             original_actions = torch.tensor(response.original_actions)
+            qsize_pre_merge = self._action_queue.qsize()
+            chunk_len = processed_actions.shape[0] if processed_actions.dim() > 1 else 1
             self._action_queue.merge(
                 original_actions=original_actions,
                 processed_actions=processed_actions,
                 real_delay=real_delay,
                 action_index_before_inference=action_index_before_inference,
             )
+            qsize_post_merge = self._action_queue.qsize()
+
+            t_prev_inference_end = time.perf_counter()
 
             print(
                 f"[inference #{iteration}] "
+                f"dt_inter={dt_since_prev_ms:.0f}ms | "
                 f"encode={encode_ms:.0f}ms | "
                 f"model={response.inference_time_ms:.0f}ms | "
                 f"overhead={overhead_ms:.0f}ms | "
                 f"total={rtt_ms:.0f}ms | "
-                f"queue={self._action_queue.qsize()}"
+                f"real_delay={real_delay} | "
+                f"thresh={threshold} | "
+                f"q_gate={qsize_at_gate} pre={qsize_pre_request} premerge={qsize_pre_merge} post={qsize_post_merge} "
+                f"delta={qsize_post_merge - qsize_pre_merge:+d} | "
+                f"chunk={chunk_len} | "
+                f"skips={skipped_throttle}",
+                flush=True,
             )
+            skipped_throttle = 0
